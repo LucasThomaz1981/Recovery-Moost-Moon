@@ -1,0 +1,88 @@
+name: Bitcoin Recovery Optimized Workflow (8x Parallel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      addresses_file:
+        description: 'Nome do arquivo de endereços alvo'
+        required: true
+        default: 'addresses_to_check.txt'
+
+jobs:
+  run_recovery_script:
+    strategy:
+      fail-fast: false
+      matrix:
+        mask_file: 
+          - rockyou-1-60-part-01.hcmask
+          - rockyou-1-60-part-02.hcmask
+          - rockyou-2-60-part-01.hcmask
+          - rockyou-2-60-part-02.hcmask
+          - rockyou-2-60-part-03.hcmask
+          - rockyou-2-60-part-04.hcmask
+          - rockyou-2-60-part-05.hcmask
+          - rockyou-2-60-part-06.hcmask
+          - rockyou-2-60-part-07.hcmask
+          - rockyou-2-60-part-08.hcmask
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install coincurve
+
+    - name: Run Recovery Script
+      id: run_script
+      run: |
+        MASK_FILE=${{ matrix.mask_file }}
+        ADDRESSES_FILE=${{ github.event.inputs.addresses_file }}
+        OUTPUT_FILE=recovered_keys-${{ matrix.mask_file }}.txt
+        
+        echo "Iniciando a execução com máscara: $MASK_FILE"
+        python bitcoin_recovery_final.py $MASK_FILE $ADDRESSES_FILE $OUTPUT_FILE
+        echo "Execução concluída. Resultados em $OUTPUT_FILE"
+        echo "output_file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
+
+    - name: Upload Recovery Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-results-${{ matrix.mask_file }}
+        path: ${{ steps.run_script.outputs.output_file }}
+        retention-days: 7
+
+  collect_results:
+    runs-on: ubuntu-latest
+    needs: run_recovery_script
+    if: always()
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Combine Results
+      run: |
+        echo "# Bitcoin Recovery Results - Combined" > combined_recovered_keys.txt
+        echo "# Date: $(date)" >> combined_recovered_keys.txt
+        echo "# Format: Password | Private Key (WIF) | Bitcoin Address" >> combined_recovered_keys.txt
+        echo "" >> combined_recovered_keys.txt
+        
+        find artifacts -name "recovered_keys-*.txt" -exec cat {} + >> combined_recovered_keys.txt
+        
+    - name: Upload Combined Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: combined-recovery-results
+        path: combined_recovered_keys.txt
+        retention-days: 7
