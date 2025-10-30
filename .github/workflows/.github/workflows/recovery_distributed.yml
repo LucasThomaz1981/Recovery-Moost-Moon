@@ -1,0 +1,160 @@
+name: Bitcoin Recovery - Distributed Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_file:
+        description: 'Arquivo de configuração de ataques (ex: recovery_config.json)'
+        required: true
+        default: 'recovery_config.json'
+
+jobs:
+  # Job 1: Configuração e Geração da Matriz de Ataques
+  setup_and_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      output_file: ${{ steps.set-matrix.outputs.output_file }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        
+    - name: Install Dependencies
+      run: pip install coincurve bip_utils
+      
+    - name: Generate Attack Matrix
+      id: set-matrix
+      run: |
+        python -c "
+import json
+import sys
+
+config_file = '${{ github.event.inputs.config_file }}'
+try:
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    print(f'::error::Arquivo de configuração {config_file} não encontrado.')
+    sys.exit(1)
+
+matrix = []
+job_id = 0
+
+# Iterar sobre todos os ataques definidos no config.json
+for attack in config.get('attacks', []):
+    job_id += 1
+    
+    if attack['type'] == 'mask_attack':
+        for file in attack['files']:
+            matrix.append({
+                'attack_type': 'mask_attack',
+                'file_path': file,
+                'output_file': f'results/mask_results_{job_id}_{file}.txt'
+            })
+    
+    elif attack['type'] == 'wordlist_attack':
+        for file in attack['files']:
+            matrix.append({
+                'attack_type': 'wordlist_attack',
+                'file_path': file,
+                'output_file': f'results/wordlist_results_{job_id}_{file}.txt'
+            })
+
+    elif attack['type'] == 'bip39_attack':
+        # O ataque BIP39 é um job único, mas precisa de todos os parâmetros
+        matrix.append({
+            'attack_type': 'bip39_attack',
+            'file_path': attack['mnemonic_file'],
+            'passphrase_file': attack.get('passphrase_file', ''),
+            'output_file': f'results/bip39_results_{job_id}.txt'
+        })
+
+print(f'Matriz de Jobs Gerada: {matrix}')
+print(f'matrix={json.dumps(matrix)}' >> $GITHUB_OUTPUT)
+print(f'output_file={config.get("output_file", "recovery_results.txt")}' >> $GITHUB_OUTPUT)
+"
+
+  # Job 2: Execução Paralela dos Ataques
+  run_attack:
+    needs: setup_and_matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJson(needs.setup_and_matrix.outputs.matrix) }}
+        
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        
+    - name: Install Dependencies
+      run: pip install coincurve bip_utils
+      
+    - name: Run Recovery Engine
+      run: |
+        # Cria o diretório de saída
+        mkdir -p results
+        
+        # Constrói o comando de execução
+        COMMAND="python bitcoin_recovery_final.py \
+          ${{ github.event.inputs.config_file }} \
+          ${{ matrix.job.attack_type }} \
+          ${{ matrix.job.file_path }} \
+          ${{ matrix.job.output_file }}"
+          
+        # Adiciona o arquivo de passphrase se for BIP39
+        if [ "${{ matrix.job.attack_type }}" == "bip39_attack" ] && [ -n "${{ matrix.job.passphrase_file }}" ]; then
+          COMMAND="$COMMAND ${{ matrix.job.passphrase_file }}"
+        fi
+        
+        echo "Executando: $COMMAND"
+        $COMMAND
+
+    - name: Upload Results Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: recovery-results-${{ matrix.job.attack_type }}-${{ hashFiles(matrix.job.file_path) }}
+        path: results
+        retention-days: 7
+        
+  # Job 3: Coleta e Combinação dos Resultados
+  collect_results:
+    needs: run_attack
+    runs-on: ubuntu-latest
+    if: always() # Executa mesmo se um dos jobs de ataque falhar
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Combine Results
+      run: |
+        OUTPUT_FILE=${{ needs.setup_and_matrix.outputs.output_file }}
+        
+        echo "# Bitcoin Recovery Engine Results - Combined" > $OUTPUT_FILE
+        echo "# Data: $(date)" >> $OUTPUT_FILE
+        echo "# Formato: Senha/Mnemonic | Chave Privada (WIF) | Endereço Bitcoin" >> $OUTPUT_FILE
+        echo "" >> $OUTPUT_FILE
+        
+        # Encontra todos os arquivos de resultado e concatena
+        find artifacts -name "*.txt" -exec cat {} + >> $OUTPUT_FILE
+        
+    - name: Upload Combined Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: combined-recovery-results
+        path: ${{ needs.setup_and_matrix.outputs.output_file }}
+        retention-days: 7
